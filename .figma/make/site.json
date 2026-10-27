@@ -1,0 +1,10 @@
+{
+  "description": "통계청 CSV 데이터를 차트와 그래프로 시각화해 통계 정보를 쉽게 이해하고 분석할 수 있도록 돕습니다.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
