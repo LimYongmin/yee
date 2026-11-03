@@ -1,5 +1,65 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { createClient } from "@supabase/supabase-js"
 import { continents, countries, world, years } from "./data"
+
+interface SensorReading {
+  id: string
+  value: number
+  created_at: string
+}
+
+interface SerialPortLike {
+  open(options: { baudRate: number }): Promise<void>
+  close(): Promise<void>
+  readable: ReadableStream<Uint8Array> | null
+}
+
+interface WebSerialApi {
+  requestPort(): Promise<SerialPortLike>
+}
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+const supabase =
+  supabaseUrl && supabaseAnonKey
+    ? createClient(supabaseUrl, supabaseAnonKey)
+    : null
+
+function parseReading(row: unknown): SensorReading | null {
+  if (!row || typeof row !== "object") return null
+  const record = row as Record<string, unknown>
+  const value = Number(record.value)
+  if (
+    (typeof record.id !== "number" && typeof record.id !== "string") ||
+    !Number.isFinite(value) ||
+    typeof record.created_at !== "string"
+  ) {
+    return null
+  }
+  return { id: String(record.id), value, created_at: record.created_at }
+}
+
+function mergeReadings(
+  current: SensorReading[],
+  incoming: SensorReading[],
+): SensorReading[] {
+  const byId = new Map(current.map((reading) => [reading.id, reading]))
+  for (const reading of incoming) byId.set(reading.id, reading)
+  return [...byId.values()]
+    .sort(
+      (a, b) =>
+        Date.parse(a.created_at) - Date.parse(b.created_at) ||
+        a.id.localeCompare(b.id, undefined, { numeric: true }),
+    )
+    .slice(-100)
+}
+
+function parseSerialValue(line: string) {
+  const trimmed = line.trim()
+  const rawMatch = trimmed.match(/\bRaw:\s*(-?(?:\d+(?:\.\d*)?|\.\d+))/i)
+  const value = Number(rawMatch?.[1] ?? trimmed)
+  return trimmed && Number.isFinite(value) ? value : null
+}
 
 const palette = [
   "#526B57",
@@ -10,23 +70,6 @@ const palette = [
   "#718065",
 ]
 const format = new Intl.NumberFormat("ko-KR")
-const sensorSeries = {
-  "24시간": {
-    labels: ["00:00", "04:00", "08:00", "12:00", "16:00", "20:00", "현재"],
-    values: [58.2, 60.8, 64.1, 68.9, 66.7, 70.1, 72.4],
-  },
-  "7일": {
-    labels: ["월", "화", "수", "목", "금", "토", "오늘"],
-    values: [61.5, 63.2, 60.8, 65.4, 68.1, 69.6, 72.4],
-  },
-  "30일": {
-    labels: ["1일", "5일", "10일", "15일", "20일", "25일", "오늘"],
-    values: [55.9, 59.7, 62.1, 60.4, 66.8, 69.2, 72.4],
-  },
-} as const
-
-type SensorPeriod = keyof typeof sensorSeries
-
 function compact(value: number) {
   if (value >= 100_000) return `${(value / 100_000).toFixed(2)}억`
   if (value >= 10_000) return `${(value / 10_000).toFixed(1)}천만`
@@ -68,11 +111,90 @@ function SensorIcon() {
 
 export default function App() {
   const [view, setView] = useState<"sensor" | "population">("sensor")
-  const [sensorPeriod, setSensorPeriod] = useState<SensorPeriod>("24시간")
   const [yearIndex, setYearIndex] = useState(4)
   const [query, setQuery] = useState("")
   const [region, setRegion] = useState("전체")
   const [selected, setSelected] = useState("인도")
+  const [liveValues, setLiveValues] = useState<number[]>([])
+  const [readings, setReadings] = useState<SensorReading[]>([])
+  const [readingsStatus, setReadingsStatus] = useState<
+    "connecting" | "connected" | "error"
+  >("connecting")
+  const [readingsError, setReadingsError] = useState("")
+  const [isSerialConnected, setIsSerialConnected] = useState(false)
+  const [serialError, setSerialError] = useState("")
+  const serialPortRef = useRef<SerialPortLike | null>(null)
+  const serialReaderRef =
+    useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+
+  useEffect(() => {
+    if (!supabase) {
+      setReadingsStatus("error")
+      setReadingsError(
+        "VITE_SUPABASE_URL 또는 VITE_SUPABASE_ANON_KEY가 설정되지 않았습니다.",
+      )
+      return
+    }
+
+    let active = true
+    const channel = supabase
+      .channel("readings-dashboard")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "readings" },
+        (payload) => {
+          const reading = parseReading(payload.new)
+          if (!reading) return
+          setReadings((current) => mergeReadings(current, [reading]))
+        },
+      )
+      .subscribe((status, error) => {
+        if (!active) return
+        if (status === "SUBSCRIBED") {
+          setReadingsStatus("connected")
+        } else if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT" ||
+          status === "CLOSED"
+        ) {
+          setReadingsStatus("error")
+          setReadingsError(
+            error?.message ??
+              "Realtime 구독에 실패했습니다. Supabase에서 readings 테이블의 Realtime을 활성화해 주세요.",
+          )
+        }
+      })
+
+    const loadLatestReadings = async () => {
+      const { data, error } = await supabase
+        .from("readings")
+        .select("id, value, created_at")
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
+        .limit(100)
+
+      if (!active) return
+      if (error) {
+        setReadingsStatus("error")
+        setReadingsError(`readings 조회 실패: ${error.message}`)
+        return
+      }
+
+      const latestReadings = data
+        .map(parseReading)
+        .filter((reading): reading is SensorReading => reading !== null)
+      setReadings((current) =>
+        mergeReadings(current, latestReadings),
+      )
+      setReadingsError("")
+    }
+
+    void loadLatestReadings()
+    return () => {
+      active = false
+      void supabase.removeChannel(channel)
+    }
+  }, [])
 
   const enriched = useMemo(
     () =>
@@ -109,18 +231,174 @@ export default function App() {
     return `${28 + index * 104},${20 + ((max - value) / (max - min)) * 118}`
   })
 
-  const sensorData = sensorSeries[sensorPeriod]
-  const sensorMin = Math.min(...sensorData.values)
-  const sensorMax = Math.max(...sensorData.values)
-  const sensorAverage =
-    sensorData.values.reduce((sum, value) => sum + value, 0) /
-    sensorData.values.length
-  const sensorPoints = sensorData.values.map((value, index) => {
-    const x = 62 + index * (628 / (sensorData.values.length - 1))
-    const y = 30 + ((80 - value) / 30) * 190
-    return { x, y, value, label: sensorData.labels[index] }
+  const hasDatabaseData = readings.length > 0
+  const useSerialData = isSerialConnected
+  const displayedValues: number[] = useSerialData
+    ? liveValues
+    : readings.map((reading) => reading.value)
+  const currentSensorValue = displayedValues.at(-1) ?? null
+  const previousSensorValue =
+    displayedValues.length > 1
+      ? displayedValues[displayedValues.length - 2]
+      : undefined
+  const hasCurrentValue = currentSensorValue !== null
+  const sensorDelta =
+    previousSensorValue === undefined || currentSensorValue === null
+      ? null
+      : currentSensorValue - previousSensorValue
+  const sensorMin = displayedValues.length ? Math.min(...displayedValues) : null
+  const sensorMax = displayedValues.length ? Math.max(...displayedValues) : null
+  const sensorScaleMax =
+    sensorMax === null
+      ? 1023
+      : Math.max(1023, Math.ceil(sensorMax / 100) * 100)
+  const sensorAverage = hasCurrentValue
+    ? displayedValues.reduce((sum, value) => sum + value, 0) /
+      displayedValues.length
+    : undefined
+  const latestReading = readings.at(-1)
+  const lastUpdate = useSerialData
+    ? "실시간 수신 중"
+    : latestReading
+      ? new Intl.DateTimeFormat("ko-KR", {
+          month: "numeric",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(new Date(latestReading.created_at))
+      : "데이터 없음"
+  const sensorPoints = displayedValues.map((value, index) => {
+    const x =
+      displayedValues.length === 1
+        ? 690
+        : 62 + index * (628 / (displayedValues.length - 1))
+    const y = 30 + ((sensorScaleMax - value) / sensorScaleMax) * 190
+    return { x, y, value }
   })
-  const sensorArea = `M ${sensorPoints[0].x} 232 L ${sensorPoints.map((point) => `${point.x} ${point.y}`).join(" L ")} L ${sensorPoints.at(-1)?.x} 232 Z`
+  const sensorArea =
+    sensorPoints.length > 1
+      ? `M ${sensorPoints[0].x} 220 L ${sensorPoints.map((point) => `${point.x} ${point.y}`).join(" L ")} L ${sensorPoints.at(-1)?.x} 220 Z`
+      : ""
+  const liveChartTicks = [0, 0.25, 0.5, 0.75, 1]
+    .map((fraction) => {
+      const index = Math.round((displayedValues.length - 1) * fraction)
+      return {
+        index,
+        label: String(index + 1),
+        x:
+          displayedValues.length === 1
+            ? 690
+            : 62 + index * (628 / (displayedValues.length - 1)),
+      }
+    })
+    .filter(
+      (tick, index, ticks) =>
+        displayedValues.length > 0 &&
+        ticks.findIndex((candidate) => candidate.index === tick.index) ===
+          index,
+    )
+
+  const disconnectSerial = async () => {
+    const reader = serialReaderRef.current
+    const port = serialPortRef.current
+    serialReaderRef.current = null
+    serialPortRef.current = null
+    setIsSerialConnected(false)
+
+    if (reader) {
+      try {
+        await reader.cancel()
+      } catch (error) {
+        setSerialError(`읽기 종료 오류: ${String(error)}`)
+      } finally {
+        reader.releaseLock()
+      }
+    }
+
+    if (port) {
+      try {
+        await port.close()
+      } catch (error) {
+        setSerialError(`포트 종료 오류: ${String(error)}`)
+      }
+    }
+  }
+
+  const connectSerial = async () => {
+    setSerialError("")
+    const serial = (navigator as Navigator & { serial?: WebSerialApi }).serial
+    if (!serial) {
+      setSerialError(
+        "이 브라우저는 Web Serial API를 지원하지 않습니다. Chrome 또는 Edge에서 열어주세요.",
+      )
+      return
+    }
+
+    let port: SerialPortLike | null = null
+    try {
+      port = await serial.requestPort()
+      await port.open({ baudRate: 9600 })
+      if (!port.readable) {
+        throw new Error("선택한 시리얼 포트에서 데이터를 읽을 수 없습니다.")
+      }
+
+      const reader = port.readable.getReader()
+      serialPortRef.current = port
+      serialReaderRef.current = reader
+      setLiveValues([])
+      setIsSerialConnected(true)
+
+      let buffer = ""
+      const decoder = new TextDecoder()
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split(/\r?\n/)
+          buffer = lines.pop() ?? ""
+
+          for (const line of lines) {
+            if (!line.trim()) continue
+            const value = parseSerialValue(line)
+            if (value === null) {
+              setSerialError(`Raw 숫자를 찾을 수 없는 시리얼 값: ${line.trim()}`)
+              continue
+            }
+            setSerialError("")
+            setLiveValues((current) => [...current, value].slice(-100))
+          }
+        }
+      } catch (error) {
+        if (serialReaderRef.current === reader) {
+          setSerialError(`시리얼 읽기 오류: ${String(error)}`)
+        }
+      } finally {
+        if (serialReaderRef.current === reader) {
+          serialReaderRef.current = null
+          serialPortRef.current = null
+          setIsSerialConnected(false)
+          reader.releaseLock()
+          try {
+            await port.close()
+          } catch (error) {
+            setSerialError(`포트 종료 오류: ${String(error)}`)
+          }
+        }
+      }
+    } catch (error) {
+      if (port) {
+        try {
+          await port.close()
+        } catch (closeError) {
+          setSerialError(`포트 종료 오류: ${String(closeError)}`)
+          return
+        }
+      }
+      if (error instanceof DOMException && error.name === "AbortError") return
+      setSerialError(`시리얼 연결 오류: ${String(error)}`)
+    }
+  }
 
   return (
     <main>
@@ -143,9 +421,17 @@ export default function App() {
             인구 데이터
           </button>
         </nav>
-        <div className="source-pill">
+        <div
+          className={`source-pill ${view === "sensor" && readingsStatus === "connected" ? "serial-online" : ""}`}
+        >
           <span />{" "}
-          {view === "sensor" ? "샘플 데이터 · 연결 대기" : "KOSIS 국가통계포털"}
+          {view === "sensor"
+            ? readingsStatus === "connected"
+              ? "Supabase · Realtime 연결"
+              : readingsStatus === "connecting"
+                ? "Supabase 연결 중"
+                : "Supabase 연결 오류"
+            : "KOSIS 국가통계포털"}
         </div>
       </header>
 
@@ -175,9 +461,19 @@ export default function App() {
                 </div>
                 <h2>B10k 센서 현황</h2>
               </div>
-              <p>
-                마지막 업데이트 <strong>오늘 14:32</strong>
-              </p>
+              <div className="sensor-actions">
+                <p>
+                  마지막 업데이트 <strong>{lastUpdate}</strong>
+                </p>
+                <button
+                  className="serial-connect-button"
+                  onClick={
+                    isSerialConnected ? disconnectSerial : connectSerial
+                  }
+                >
+                  {isSerialConnected ? "연결 끊기" : "시리얼 연결"}
+                </button>
+              </div>
             </div>
 
             <div className="sensor-grid">
@@ -186,23 +482,50 @@ export default function App() {
                   <span className="sensor-icon">
                     <SensorIcon />
                   </span>
-                  <span className="sensor-status">정상 범위</span>
+                  <span className="sensor-status">
+                    {useSerialData
+                      ? "Raw 실시간 수신"
+                      : readingsStatus === "connected"
+                        ? "Supabase 실시간"
+                        : readingsStatus === "connecting"
+                          ? "데이터 연결 중"
+                          : "연결 확인 필요"}
+                  </span>
                 </div>
                 <p>현재 센서값</p>
                 <strong>
-                  72.4<small>INDEX</small>
+                  {currentSensorValue === null
+                    ? "—"
+                    : currentSensorValue.toFixed(1)}
+                  <small>INDEX</small>
                 </strong>
                 <div className="sensor-delta">
-                  <b>+2.3</b>
-                  <span>1시간 전 대비</span>
+                  <b>
+                    {sensorDelta === null
+                      ? "—"
+                      : `${sensorDelta >= 0 ? "+" : ""}${sensorDelta.toFixed(1)}`}
+                  </b>
+                  <span>
+                    {previousSensorValue === undefined
+                      ? "비교 데이터 대기 중"
+                      : "이전 기록 대비"}
+                  </span>
                 </div>
                 <div className="sensor-scale">
                   <div>
-                    <i style={{ width: "72.4%" }} />
+                    <i
+                      style={{
+                        width: `${Math.min(100, Math.max(0, ((currentSensorValue ?? 0) / sensorScaleMax) * 100))}%`,
+                      }}
+                    />
                   </div>
                   <span>0</span>
-                  <span>권장 범위 40—80</span>
-                  <span>100</span>
+                  <span>
+                    {useSerialData
+                      ? `Raw 범위 0—${sensorScaleMax}`
+                      : `센서 범위 0—${sensorScaleMax}`}
+                  </span>
+                  <span>{sensorScaleMax}</span>
                 </div>
               </article>
 
@@ -210,27 +533,17 @@ export default function App() {
                 <div className="chart-card-head">
                   <div>
                     <p className="eyebrow">SENSOR TREND</p>
-                    <h3>시간에 따른 변화</h3>
+                    <h3>최근 센서값</h3>
                   </div>
-                  <div className="period-control" aria-label="조회 기간">
-                    {(Object.keys(sensorSeries) as SensorPeriod[]).map(
-                      (period) => (
-                        <button
-                          key={period}
-                          className={sensorPeriod === period ? "active" : ""}
-                          onClick={() => setSensorPeriod(period)}
-                        >
-                          {period}
-                        </button>
-                      ),
-                    )}
-                  </div>
+                  <span className="live-count">
+                    최근 {displayedValues.length} / 100개
+                  </span>
                 </div>
                 <svg
                   className="sensor-chart"
                   viewBox="0 0 730 278"
                   role="img"
-                  aria-label={`${sensorPeriod} B10k 센서값 변화`}
+                  aria-label={`Supabase readings 최근 ${displayedValues.length}개 값 변화`}
                 >
                   <defs>
                     <linearGradient id="sensorArea" x1="0" y1="0" x2="0" y2="1">
@@ -238,7 +551,7 @@ export default function App() {
                       <stop offset="100%" stopColor="#d2a43b" stopOpacity="0" />
                     </linearGradient>
                   </defs>
-                  {[30, 93.3, 156.6, 220].map((y, index) => (
+                  {[30, 77.5, 125, 172.5, 220].map((y, index) => (
                     <g key={y}>
                       <line
                         x1="62"
@@ -248,11 +561,13 @@ export default function App() {
                         className="sensor-grid-line"
                       />
                       <text x="42" y={y + 4} textAnchor="end">
-                        {80 - index * 10}
+                        {Math.round(sensorScaleMax * (1 - index / 4))}
                       </text>
                     </g>
                   ))}
-                  <path d={sensorArea} className="sensor-area" />
+                  {sensorArea && (
+                    <path d={sensorArea} className="sensor-area" />
+                  )}
                   <polyline
                     points={sensorPoints
                       .map((point) => `${point.x},${point.y}`)
@@ -260,52 +575,100 @@ export default function App() {
                     className="sensor-line"
                   />
                   {sensorPoints.map((point, index) => (
-                    <g key={point.label}>
+                    <g key={`${index}-${point.value}`}>
                       <circle
                         cx={point.x}
                         cy={point.y}
-                        r={index === sensorPoints.length - 1 ? 6 : 3}
+                        r={index === sensorPoints.length - 1 ? 6 : 0}
                         className={
                           index === sensorPoints.length - 1
                             ? "sensor-current-dot"
                             : ""
                         }
                       />
-                      <text x={point.x} y="260" textAnchor="middle">
-                        {point.label}
-                      </text>
                     </g>
                   ))}
+                  {liveChartTicks.map((tick) => (
+                      <text
+                        key={tick.index}
+                        x={tick.x}
+                        y="260"
+                        textAnchor="middle"
+                      >
+                        {tick.label}
+                      </text>
+                  ))}
+                  {!displayedValues.length && (
+                    <text
+                      x="376"
+                      y="130"
+                      textAnchor="middle"
+                      className="sensor-empty-label"
+                    >
+                      {readingsStatus === "connecting"
+                        ? "데이터 불러오는 중..."
+                        : readingsError
+                          ? "데이터를 불러오지 못했습니다"
+                          : "저장된 센서값이 없습니다"}
+                    </text>
+                  )}
                 </svg>
+                <p className="chart-caption">
+                  {useSerialData
+                    ? "브라우저 시리얼 · 최근 100개"
+                    : "Supabase readings · Realtime 구독"}
+                </p>
               </article>
             </div>
 
             <div className="sensor-summary">
               <div>
                 <span>평균값</span>
-                <strong>{sensorAverage.toFixed(1)}</strong>
-                <small>{sensorPeriod} 기준</small>
+                <strong>{sensorAverage?.toFixed(1) ?? "—"}</strong>
+                <small>
+                  {hasCurrentValue
+                    ? `최근 ${displayedValues.length}개 기준`
+                    : "데이터 없음"}
+                </small>
               </div>
               <div>
                 <span>최저값</span>
-                <strong>{sensorMin.toFixed(1)}</strong>
+                <strong>{sensorMin?.toFixed(1) ?? "—"}</strong>
                 <small>
-                  {sensorData.labels[sensorData.values.indexOf(sensorMin)]}
+                  {sensorMin === null
+                    ? "데이터 없음"
+                    : `#${displayedValues.indexOf(sensorMin) + 1}`}
                 </small>
               </div>
               <div>
                 <span>최고값</span>
-                <strong>{sensorMax.toFixed(1)}</strong>
+                <strong>{sensorMax?.toFixed(1) ?? "—"}</strong>
                 <small>
-                  {sensorData.labels[sensorData.values.indexOf(sensorMax)]}
+                  {sensorMax === null
+                    ? "데이터 없음"
+                    : `#${displayedValues.indexOf(sensorMax) + 1}`}
                 </small>
               </div>
               <div className="connection-note">
                 <span>DATA CONNECTION</span>
-                <p>
-                  현재 예시 데이터로 표시 중입니다.
+                <p className={serialError ? "serial-error" : ""}>
+                  {serialError ||
+                    (useSerialData
+                      ? "9600 baud 시리얼 값을 표시 중입니다."
+                      : readingsError ||
+                        (readingsStatus === "connecting"
+                          ? "Supabase readings 데이터를 조회 중입니다."
+                          : readingsStatus === "connected"
+                            ? hasDatabaseData
+                              ? "최신 readings를 Realtime으로 구독 중입니다."
+                              : "Realtime 연결됨 · 새 readings 대기 중입니다."
+                            : "Supabase 연결 상태를 확인해 주세요."))}
                   <br />
-                  실제 센서 연동 후 자동으로 업데이트됩니다.
+                  {serialError
+                    ? "포트와 아두이노의 줄바꿈 설정을 확인해주세요."
+                    : readingsStatus === "error" && !useSerialData
+                      ? "Supabase 설정과 Realtime publication을 확인해 주세요."
+                      : "새 행은 자동으로 반영됩니다."}
                 </p>
               </div>
             </div>
@@ -579,7 +942,9 @@ export default function App() {
         </span>
         <p>
           {view === "sensor"
-            ? "본 화면은 예시 데이터를 사용합니다."
+            ? useSerialData
+              ? "아두이노 Raw 실시간 데이터"
+              : "Supabase readings · Realtime 구독"
             : "자료: 통계청 KOSIS · 국가별 장래인구 (2096—2100)"}
         </p>
       </footer>
