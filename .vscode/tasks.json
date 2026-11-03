@@ -1,0 +1,24 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Start Vite dev server",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "$port = New-Object System.Net.Sockets.TcpClient; try { $port.Connect('127.0.0.1', 8443); Write-Output 'http://localhost:8443/' } catch { corepack pnpm dev } finally { $port.Dispose() }"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "base": "$tsc-watch",
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": ".*",
+                    "endsPattern": "http://localhost:8443/"
+                }
+            }
+        }
+    ]
+}
